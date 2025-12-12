@@ -22,10 +22,12 @@
 #define MILLION 1000000LL
 #define NUM_SAMPLES 5000 /* 5000 * 2 ms ≈ 10 секунд эксперимента */
 
+// Вспомогательная функция: перевод timespec в наносекунды
 static inline int64_t timespec_to_ns(const struct timespec *ts) {
     return (int64_t)ts->tv_sec * BILLION + (int64_t)ts->tv_nsec;
 }
 
+// Вспомогательная функция: перевод наносекунд в timespec
 static inline void ns_to_timespec(int64_t ns, struct timespec *ts) {
     ts->tv_sec = (time_t)(ns / BILLION);
     ts->tv_nsec = (long)(ns % BILLION);
@@ -35,12 +37,13 @@ static inline void ns_to_timespec(int64_t ns, struct timespec *ts) {
 int main(void) {
     struct timespec res_rt = {0}, res_mono = {0};
     struct timespec t_next = {0}, now = {0};
-    const int64_t period_ns = 2 * MILLION; /* 2 ms */
+    const int64_t period_ns = 2 * MILLION; /* Период 2 мс */
     int64_t deltas_ns[NUM_SAMPLES];
     int samples = 0;
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    // Получаем разрешение часов (для справки)
     if (clock_getres(CLOCK_REALTIME, &res_rt) != 0) {
         fprintf(stderr, "clock_getres(CLOCK_REALTIME) failed: %s\n", strerror(errno));
         return EXIT_FAILURE;
@@ -53,34 +56,59 @@ int main(void) {
     printf("Resolution: REALTIME=%ld ns, MONOTONIC=%ld ns\n",
            (long)res_rt.tv_nsec, (long)res_mono.tv_nsec);
 
+    // Инициализируем время старта
     if (clock_gettime(CLOCK_MONOTONIC, &t_next) != 0) {
         fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
 
-    int64_t next_ns = timespec_to_ns(&t_next) + period_ns; /* стартуем через один период */
+    // [MODIFIED] Сохраняем время "предыдущего" пробуждения для расчета интервала
+    int64_t start_ns = timespec_to_ns(&t_next);
+    int64_t prev_wakeup_ns = start_ns;
+    int64_t next_target_ns = start_ns;
+
+    /* 
+     * [COMMENT FOR LAB]
+     * Почему TIMER_ABSTIME важен?
+     * Если использовать относительный сон (rel_time), то:
+     *   Время_цикла = Время_сна + Время_работы + Джиттер
+     * Ошибка будет накапливаться с каждой итерацией (Drift). 
+     * Через 1000 циклов мы отстанем существенно.
+     * 
+     * С TIMER_ABSTIME мы говорим: "Разбуди меня ровно в 12:00:01, потом в 12:00:02".
+     * Если мы проснулись чуть позже или работали долго, следующий сон просто будет короче.
+     * Ошибка НЕ накапливается.
+     */
+
     for (samples = 0; samples < NUM_SAMPLES; ++samples) {
-        ns_to_timespec(next_ns, &t_next);
+        // [MODIFIED] Рассчитываем следующее АБСОЛЮТНОЕ время пробуждения
+        next_target_ns += period_ns; 
+        ns_to_timespec(next_target_ns, &t_next);
 
         /* Абсолютный сон до t_next: устойчив к дрейфу */
         int rc;
         do {
             rc = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t_next, NULL);
         } while (rc == EINTR);
+        
         if (rc != 0) {
             fprintf(stderr, "clock_nanosleep failed: %s\n", strerror(rc));
             return EXIT_FAILURE;
         }
 
+        // Замеряем фактическое время пробуждения
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
             fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
             return EXIT_FAILURE;
         }
 
         int64_t now_ns = timespec_to_ns(&now);
-        deltas_ns[samples] = now_ns - (next_ns - period_ns); /* фактическая дельта */
-
-        next_ns += period_ns;
+        
+        // [MODIFIED] Считаем интервал между текущим и прошлым пробуждением
+        // Идеал: должно быть ровно 2 000 000 нс.
+        deltas_ns[samples] = now_ns - prev_wakeup_ns; 
+        
+        prev_wakeup_ns = now_ns;
     }
 
     /* Статистика */
@@ -92,9 +120,8 @@ int main(void) {
     }
     double avg_ns = (double)sum_ns / (double)NUM_SAMPLES;
 
-    // --- (Новое) Расчет стандартного отклонения ---
-    // Это показывает, насколько значения разбросаны вокруг среднего.
-    // Маленькое значение => стабильный период.
+    // [MODIFIED] Расчет стандартного отклонения (Standard Deviation)
+    // Показывает стабильность таймера (насколько велик разброс)
     double sum_sq_diff = 0;
     for (int i = 0; i < NUM_SAMPLES; ++i) {
         sum_sq_diff += pow((double)deltas_ns[i] - avg_ns, 2);
@@ -106,7 +133,7 @@ int main(void) {
            min_ns, avg_ns, max_ns, std_dev_ns);
 
     /* Вывести первые несколько измерений для наглядности */
-    printf("\nFirst 10 samples (delta from previous actual wakeup, ns):\n");
+    printf("\nFirst 10 intervals (ns):\n");
     for (int i = 0; i < 10 && i < NUM_SAMPLES; ++i) {
         printf("  sample %d: %" PRId64 "\n", i, deltas_ns[i]);
     }
@@ -114,33 +141,9 @@ int main(void) {
     return EXIT_SUCCESS;
 }
 #else
+// Fallback для не-Linux систем (оставляем как было в примере)
 int main(void) {
-    struct timespec res_rt = {0};
-    const long period_ns = 2 * 1000000L; /* 2 ms */
-    struct timespec req;
-    struct timespec start, prev, now;
-    const int num_samples = 5000;
-    long min_ns = 999999999L, max_ns = 0; long long sum_ns = 0;
-
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    clock_getres(CLOCK_REALTIME, &res_rt);
-    printf("Resolution (CLOCK_REALTIME) ~ %ld ns (emulated periodic sleep)\n", res_rt.tv_nsec);
-    clock_gettime(CLOCK_REALTIME, &start);
-    prev = start;
-
-    for (int i = 0; i < num_samples; ++i) {
-        req.tv_sec = 0; req.tv_nsec = period_ns;
-        nanosleep(&req, NULL);
-        clock_gettime(CLOCK_REALTIME, &now);
-        long delta = (long)((now.tv_sec - prev.tv_sec) * 1000000000LL + (now.tv_nsec - prev.tv_nsec));
-        if (delta < min_ns) min_ns = delta;
-        if (delta > max_ns) max_ns = delta;
-        sum_ns += delta;
-        prev = now;
-    }
-    double avg = (double)sum_ns / (double)num_samples;
-    printf("2ms-period stats over %d samples (relative_sleep): min=%ld ns, avg=%.1f ns, max=%ld ns\n",
-           num_samples, min_ns, avg, max_ns);
-    return EXIT_SUCCESS;
+    fprintf(stderr, "This example requires Linux with CLOCK_MONOTONIC support.\n");
+    return EXIT_FAILURE;
 }
 #endif

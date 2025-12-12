@@ -1,14 +1,7 @@
 /*
  * Демонстрация периодического таймера с использованием timerfd.
  *
- * Цель: Показать способ создания периодических задач. timerfd представляет таймер как файловый
- * дескриптор, что позволяет интегрировать его с механизмами вроде poll/epoll.
- *
- * Сценарий:
- * 1. Создать таймер с помощью timerfd_create.
- * 2. Настроить его на первое срабатывание через 5 секунд,
- *    а затем периодически каждые 1.5 секунды.
- * 3. В цикле ожидать срабатывания таймера, читая из его файлового дескриптора.
+ * Цель: Показать способ создания периодических задач через файловый дескриптор.
  */
 
 #define _GNU_SOURCE
@@ -26,10 +19,6 @@
 #include <sys/timerfd.h>
 #endif
 
-static inline int64_t to_ns(const struct timespec *ts) {
-    return (int64_t)ts->tv_sec * 1000000000LL + (int64_t)ts->tv_nsec;
-}
-
 #ifdef __linux__
 int main(void) {
     int tfd;
@@ -40,37 +29,37 @@ int main(void) {
 
     setvbuf(stdout, NULL, _IOLBF, 0);
 
-    // CLOCK_MONOTONIC - лучший выбор для таймеров, т.к. на него не влияет
-    // изменение системного времени (NTP, date).
-    // TFD_CLOEXEC - хорошая практика, чтобы дескриптор не наследовался дочерними процессами.
+    // 1. Создаем таймер (CLOCK_MONOTONIC, чтобы не зависеть от перевода часов)
     tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (tfd == -1) {
         perror("timerfd_create failed");
         return EXIT_FAILURE;
     }
 
-    // Настройка времени: первое срабатывание
+    // 2. Настройка времени: первое срабатывание через 5 секунд
     its.it_value.tv_sec = 5;
     its.it_value.tv_nsec = 0;
 
-    // Настройка времени: период после первого срабатывания
+    // 3. Настройка периода: каждые 1.5 секунды (1 сек + 500 млн наносек)
     its.it_interval.tv_sec = 1;
-    its.it_interval.tv_nsec = 500000000; // 1.5 секунды
+    its.it_interval.tv_nsec = 500000000; 
 
+    // Запускаем таймер
     if (timerfd_settime(tfd, 0, &its, NULL) == -1) {
         perror("timerfd_settime failed");
         close(tfd);
         return EXIT_FAILURE;
     }
 
-    printf("Timer configured. Waiting for %d expirations...\n", iterations_to_run);
+    printf("Timer started. Initial wait: 5s, then period: 1.5s.\n");
+    printf("Waiting for %d expirations...\n", iterations_to_run);
+
     for (int i = 0; i < iterations_to_run; ++i) {
-        // read() блокируется, пока таймер не сработает.
-        // Возвращает 8 байт (uint64_t), содержащих количество истечений таймера.
-        // Если система не сильно нагружена, это значение будет 1.
+        // 4. Ожидание события. read() заблокируется, пока таймер не "тикнет".
+        // Он вернет количество срабатываний (обычно 1, если мы успеваем обрабатывать).
         ssize_t rd = read(tfd, &expirations, sizeof(expirations));
         if (rd < 0) {
-            if (errno == EINTR) { // Прервано сигналом, можно проигнорировать
+            if (errno == EINTR) { 
                 --i;
                 continue;
             }
@@ -79,22 +68,41 @@ int main(void) {
             return EXIT_FAILURE;
         }
 
+        // Получаем текущее время для лога
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
             perror("clock_gettime failed");
             close(tfd);
             return EXIT_FAILURE;
         }
-        printf("Timer expired! Timestamp: [%ld.%09ld], expirations counter: %" PRIu64 "\n",
+        printf("Timer expired! Timestamp: [%ld.%09ld], expirations: %" PRIu64 "\n",
                now.tv_sec, now.tv_nsec, expirations);
     }
 
     close(tfd);
+    
+    /* 
+     * --- ОТВЕТ НА ВОПРОС ЗАДАНИЯ (Comparison) ---
+     * 
+     * clock_nanosleep vs timerfd:
+     * 
+     * 1. clock_nanosleep:
+     *    - Блокирует весь поток. Поток не может делать ничего другого, пока спит.
+     *    - Просто использовать для простых циклов "while(1) { work(); sleep(); }".
+     * 
+     * 2. timerfd:
+     *    - Превращает время в ФАЙЛОВЫЙ ДЕСКРИПТОР.
+     *    - ГЛАВНОЕ ПРЕИМУЩЕСТВО: Интеграция с epoll/poll/select.
+     *    - Позволяет реализовать Event Loop: один поток может ждать и таймера,
+     *      и прихода данных по сети, и нажатия кнопки одновременно.
+     *      Пример: epoll_wait() разбудит нас, если сработает таймер ИЛИ придут данные.
+     *      С clock_nanosleep так сделать нельзя (надо создавать много потоков).
+     */
+     
     return EXIT_SUCCESS;
 }
 #else
 int main(void) {
-    printf("reptimer_timerfd: Linux-only example (timerfd not available on this platform)\n");
+    printf("Linux only.\n");
     return 0;
 }
 #endif
-
